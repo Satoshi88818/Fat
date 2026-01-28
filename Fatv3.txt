@@ -1,0 +1,272 @@
+import numpy as np
+import fatpack
+import matplotlib.pyplot as plt
+
+"""
+Enhanced fatigue analysis script for simulated satellite stress history.
+Integrates improvements:
+- Realistic material properties for aerospace aluminum (7075-T73 approximate).
+- Option for Gerber or Walker mean-stress correction (Walker more flexible).
+- Extended loading duration for representative mission-scale history.
+- Life prediction in orbits/years (LEO assumption).
+- Plots for stress history, range histogram, and rainflow matrix.
+- Custom S-N curve with shallow third slope (no hard cutoff, conservative for aluminum).
+- Knock-down factor on Sc for safety.
+- Monte-Carlo simulations for damage scatter due to noise.
+- Notch sensitivity factor Kt applied to stress, with Kf for fatigue amplitudes.
+- Export rainflow matrix and histogram to CSV.
+- Added temperature effects on S-N curve (derating for high temps).
+- Added occasional high-load events for realistic variable amplitude.
+- Option for non-linear damage rule (Corten-Dolan) to investigate beyond linear Miner.
+- Added block loading damage sum for sequence effects check (compare to cycle-by-cycle).
+- Option for multiaxial fatigue via signed von Mises equivalent stress.
+- Increased Monte-Carlo realizations for better statistics.
+"""
+
+# Material properties: Aluminum 7075-T73 (common in satellite structures)
+S_ult = 505.0  # Ultimate tensile strength (MPa)
+Sc = 150.0     # Approximate fatigue strength at ~10^7 cycles, R=-1 (MPa)
+
+# Improvement parameters
+use_walker = True      # Set to False to use Gerber
+gamma = 0.5            # Walker exponent (0.5 approximates Gerber for some materials)
+SF = 1.5               # Safety factor knock-down on Sc
+Kt = 1.5               # Notch sensitivity factor (e.g., for fillets or holes)
+q = 0.5                # Notch sensitivity (0-1, material/geometry dependent)
+Kf = 1 + q * (Kt - 1)  # Fatigue notch factor
+num_realizations = 50  # Increased for tighter confidence intervals
+m3 = 10.0              # Shallow slope for very high cycle fatigue (8-12 typical)
+use_nonlinear = False  # Use Corten-Dolan non-linear rule (for beyond Miner)
+nonlinear_d = 8.0      # Exponent for Corten-Dolan (typical for aluminum)
+use_multiaxial = False # Use signed von Mises for multiaxial (assume some shear)
+num_blocks = 10        # For block loading sequence check
+
+# Custom endurance curve with three slopes (no hard cutoff)
+class CustomEnduranceCurve(fatpack.EnduranceCurve):
+    def __init__(self, Sc, N_knee1=1e5, m1=3.0, N_knee2=1e7, m2=5.0, m3=10.0):
+        super().__init__(m=m1)  # Base init (dummy)
+        self.Sc = Sc
+        self.N_knee1 = N_knee1
+        self.m1 = m1
+        self.N_knee2 = N_knee2
+        self.m2 = m2
+        self.m3 = m3
+        self.S_knee2 = Sc
+        self.S_knee1 = self.S_knee2 * (self.N_knee2 / self.N_knee1) ** (1 / self.m2)
+
+    def get_lifetime(self, S):
+        S = np.asarray(S)
+        N = np.full_like(S, np.inf, dtype=float)
+        mask1 = S >= self.S_knee1
+        N[mask1] = self.N_knee1 * (self.S_knee1 / S[mask1]) ** self.m1
+        mask2 = (S >= self.S_knee2) & ~mask1
+        N[mask2] = self.N_knee2 * (self.S_knee2 / S[mask2]) ** self.m2
+        mask3 = S < self.S_knee2
+        N[mask3] = self.N_knee2 * (self.S_knee2 / S[mask3]) ** self.m3
+        return N
+
+# Gerber mean-stress correction (parabolic, less conservative than Goodman for ductile materials)
+def gerber_correction(ranges, means, S_ult):
+    correction_factor = np.ones_like(ranges)
+    positive_mean = means >= 0
+    correction_factor[positive_mean] = 1.0 / (1.0 - (means[positive_mean] / S_ult) ** 2)
+    # No correction for compressive means (common practice)
+    return ranges * correction_factor
+
+# Walker mean-stress correction (more flexible, gamma=1 ~ Goodman, gamma~0.5 for ductile)
+def walker_correction(ranges, means, S_ult, gamma=0.5):
+    correction_factor = np.ones_like(ranges)
+    positive_mean = means >= 0
+    correction_factor[positive_mean] = 1.0 / (1.0 - means[positive_mean] / S_ult) ** gamma
+    # No correction for compressive means
+    return ranges * correction_factor
+
+# Generate extended stress time history parameters
+total_time = 100000.0      # Time units (represents ~100 orbits)
+num_points = 1000000       # Dense sampling
+t = np.linspace(0, total_time, num_points)
+orbit_period = 1000.0      # Time units per orbit (matches primary cycle)
+num_orbits_history = total_time / orbit_period
+orbits_per_year_leo = 365.25 * 15  # ~96 min LEO orbits ≈ 15/day
+
+# Temperature profile (orbital thermal cycling)
+temp = 80 + 70 * np.sin(2 * np.pi * t / orbit_period)  # Ranges from 10 to 150°C
+max_temp = np.max(temp)
+if max_temp > 100:
+    derate = 1.0 - 0.004 * (max_temp - 100)  # Approximate derating, e.g., 0.8 at 150°C
+else:
+    derate = 1.0
+Sc_design = Sc / SF * derate
+
+# S-N curve
+curve = CustomEnduranceCurve(Sc_design, m3=m3)
+
+# Monte-Carlo simulations
+damages = []
+for i in range(num_realizations):
+    np.random.seed(i)  # For reproducibility
+    stress = (50 * np.sin(2 * np.pi * t / 1000) +    # Primary thermal cycle
+              20 * np.sin(2 * np.pi * t / 100) +     # Secondary oscillation
+              np.random.normal(0, 5, len(t)))        # Noise/vibration
+
+    # Add occasional high-load events (e.g., maneuvers, docking)
+    num_events = 5
+    event_times = np.random.uniform(0, total_time, num_events)
+    pulse_width = 10.0  # Narrow pulse
+    pulse_amp = 100.0   # High amplitude spike
+    for ti in event_times:
+        stress += pulse_amp * np.exp(-((t - ti)**2 / (2 * pulse_width**2)))
+
+    # Multiaxial if enabled (add shear stress, compute signed von Mises equivalent)
+    if use_multiaxial:
+        tau = (20 * np.sin(2 * np.pi * t / orbit_period * 1.5) +  # Shear cycle
+               np.random.normal(0, 3, len(t)))                    # Shear noise
+        stress = np.sign(stress) * np.sqrt(stress**2 + 3 * tau**2)  # Equivalent stress
+
+    # Note: No global Kt on stress history; apply Kt/Kf post-rainflow
+
+    # Extract reversals for computational efficiency
+    reversals = fatpack.find_reversals(stress)
+
+    # Rainflow cycle counting
+    ranges, means = fatpack.find_rainflow_ranges(reversals, return_means=True)
+
+    # Apply notch factors (Kf to amplitudes/ranges, Kt to means)
+    ranges *= Kf
+    means *= Kt
+
+    # Apply mean-stress correction
+    if use_walker:
+        ranges_corr = walker_correction(ranges, means, S_ult, gamma=gamma)
+    else:
+        ranges_corr = gerber_correction(ranges, means, S_ult)
+
+    # Cumulative damage
+    if not use_nonlinear:
+        damage = curve.find_miner_sum(ranges_corr)
+    else:
+        # Corten-Dolan non-linear rule for spectrum damage
+        S_eq = ranges_corr / 2.0
+        if len(S_eq) == 0:
+            damage = 0.0
+        else:
+            S_max = np.max(S_eq)
+            N_max = curve.get_lifetime(S_max)
+            damage = np.sum((S_eq / S_max)**nonlinear_d) / N_max
+
+    # Sequence effects check: block loading damage sum (vs. full cycle-by-cycle)
+    damage_block = 0.0
+    block_size = len(stress) // num_blocks
+    for j in range(num_blocks):
+        start = j * block_size
+        end = (j + 1) * block_size if j < num_blocks - 1 else len(stress)
+        stress_block = stress[start:end]
+        rev_block = fatpack.find_reversals(stress_block)
+        r_block, m_block = fatpack.find_rainflow_ranges(rev_block, return_means=True)
+        r_block *= Kf
+        m_block *= Kt
+        if use_walker:
+            r_corr_block = walker_correction(r_block, m_block, S_ult, gamma=gamma)
+        else:
+            r_corr_block = gerber_correction(r_block, m_block, S_ult)
+        if not use_nonlinear:
+            damage_block += curve.find_miner_sum(r_corr_block)
+        else:
+            S_eq_block = r_corr_block / 2.0
+            if len(S_eq_block) > 0:
+                S_max_block = np.max(S_eq_block)
+                N_max_block = curve.get_lifetime(S_max_block)
+                damage_block += np.sum((S_eq_block / S_max_block)**nonlinear_d) / N_max_block
+
+    print(f"Realization {i}: Cycle-by-cycle damage: {damage:.6f}, Block sum damage: {damage_block:.6f}")
+
+    damages.append(damage)
+
+# Damage statistics
+damage_array = np.array(damages)
+damage_mean = np.mean(damage_array)
+damage_std = np.std(damage_array)
+print(f"Cumulative fatigue damage (Miner's sum, mean ± std): {damage_mean:.6f} ± {damage_std:.6f}")
+
+# Life prediction (using mean damage)
+if damage_mean > 1e-12:  # Avoid division by zero
+    orbits_to_failure_mean = num_orbits_history / damage_mean
+    orbits_to_failure_std = (num_orbits_history / (damage_mean ** 2)) * damage_std  # Approximate std propagation (delta method)
+    years_to_failure_mean = orbits_to_failure_mean / orbits_per_year_leo
+    years_to_failure_std = orbits_to_failure_std / orbits_per_year_leo
+    print(f"Predicted orbits to failure (D=1, mean ± std): {orbits_to_failure_mean:.0f} ± {orbits_to_failure_std:.0f}")
+    print(f"Predicted years to failure (LEO, mean ± std): {years_to_failure_mean:.1f} ± {years_to_failure_std:.1f}")
+else:
+    print("Predicted infinite life (negligible damage)")
+
+# For visualizations and export, use the last realization (arbitrary choice)
+# Recompute for last i (seed num_realizations-1)
+np.random.seed(num_realizations - 1)
+stress = (50 * np.sin(2 * np.pi * t / 1000) +
+          20 * np.sin(2 * np.pi * t / 100) +
+          np.random.normal(0, 5, len(t)))
+# Add high-load events
+event_times = np.random.uniform(0, total_time, num_events)
+for ti in event_times:
+    stress += pulse_amp * np.exp(-((t - ti)**2 / (2 * pulse_width**2)))
+# Multiaxial if enabled
+if use_multiaxial:
+    tau = (20 * np.sin(2 * np.pi * t / orbit_period * 1.5) +
+           np.random.normal(0, 3, len(t)))
+    stress = np.sign(stress) * np.sqrt(stress**2 + 3 * tau**2)
+reversals = fatpack.find_reversals(stress)
+ranges, means = fatpack.find_rainflow_ranges(reversals, return_means=True)
+ranges *= Kf
+means *= Kt
+if use_walker:
+    ranges_corr = walker_correction(ranges, means, S_ult, gamma=gamma)
+else:
+    ranges_corr = gerber_correction(ranges, means, S_ult)
+
+# Rainflow matrix (for professional reporting/visualisation)
+matrix = fatpack.find_rainflow_matrix(ranges_corr, bins=64)
+
+# Export to CSV
+np.savetxt('rainflow_matrix.csv', matrix, delimiter=',', fmt='%.2f')
+print("Rainflow matrix exported to 'rainflow_matrix.csv'")
+
+# Rainflow histogram export
+hist, bin_edges = np.histogram(ranges_corr, bins=64)
+np.savetxt('rainflow_histogram.csv', np.column_stack((bin_edges[:-1], bin_edges[1:], hist)), delimiter=',', fmt='%.2f', header='Bin_start,Bin_end,Count', comments='')
+print("Rainflow histogram exported to 'rainflow_histogram.csv'")
+
+# === Visualisations ===
+
+# 1. Stress history (subsampled for clarity)
+plt.figure(figsize=(14, 6))
+subsample = 500
+plt.plot(t[::subsample], stress[::subsample], lw=1)
+plt.title("Simulated Stress Time History (Subsampled, Last Realization)")
+plt.xlabel("Time (arbitrary units)")
+plt.ylabel("Stress (MPa)")
+plt.grid(True)
+plt.show()
+
+# 2. Histogram of equivalent stress ranges
+plt.figure(figsize=(10, 5))
+plt.hist(ranges_corr, bins=50, edgecolor='black', alpha=0.8)
+plt.title("Distribution of Corrected Stress Ranges (Last Realization)")
+plt.xlabel("Equivalent stress range (MPa)")
+plt.ylabel("Cycle count")
+plt.grid(True)
+plt.show()
+
+# 3. Rainflow matrix heatmap
+max_range = np.max(ranges_corr)
+plt.figure(figsize=(9, 8))
+plt.imshow(matrix.T, origin='lower', aspect='auto', cmap='viridis',
+           extent=[0, max_range, 0, max_range])
+plt.colorbar(label='Cycle count')
+plt.title("Rainflow Counting Matrix (Equivalent Ranges, Last Realization)")
+plt.xlabel("From level (MPa)")
+plt.ylabel("To level (MPa)")
+plt.show()
+
+# Note: For further validation, test with constant-amplitude sine wave and compare analytical N_f.
+# Alternative counting: fatpack.find_rainflow_ranges(stress) directly (slower, no reversal extraction).
+# For full sequence effects, consider crack growth models (e.g., Paris law on ordered cycles).
